@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.WebSockets;
@@ -16,12 +17,14 @@ namespace Centrifuge.Client
         private bool disposedValue;
 
         private readonly ClientWebSocket _socket = new ClientWebSocket();
-        private readonly Dictionary<int, CommandRecord> _commands = new Dictionary<int, CommandRecord>();
-        private readonly Dictionary<string, IIncomingMessageHandler> _handlers = new Dictionary<string, IIncomingMessageHandler>();
+        private readonly ConcurrentDictionary<int, CommandRecord> _commands = new ConcurrentDictionary<int, CommandRecord>();
+        private readonly ConcurrentDictionary<string, IIncomingMessageHandler> _handlers = new ConcurrentDictionary<string, IIncomingMessageHandler>();
         private Task _pingTask;
+        private Task _connectTask;
         private Task _receiveTask;
         private readonly Uri _url;
         private readonly Func<string> _tokenGenerator;
+
 
         public CentrifugeClient(Uri url, Func<string> tokenGenerator)
         {
@@ -29,31 +32,50 @@ namespace Centrifuge.Client
             _tokenGenerator = tokenGenerator;
         }
 
+        public CentrifugeClient(string url, Func<string> tokenGenerator) : this(new Uri(url), tokenGenerator)
+        {
+        }
+
         public async Task Listen()
         {
             await _socket.ConnectAsync(_url, CancellationToken.None);
 
-            await SendAsync(Method.Connect, new
+            _connectTask = SendAsync(Method.Connect, new
             {
                 token = _tokenGenerator()
             });
+
+            await _connectTask;
+
+            // process pending subscriptions
+
+            foreach (var channel in _handlers.Keys)
+            {
+                await SendAsync(Method.Subscribe, new
+                {
+                    channel
+                });
+            }
 
             _pingTask = Task.Run(DoPing);
 
             _receiveTask = Task.Run(DoReceive);
 
             await _receiveTask;
+
         }
 
         public async Task Subscribe<TData>(string channel, Action<TData> callback)
         {
-
-            await SendAsync(Method.Subscribe, new
+            if (_connectTask != null && _connectTask.IsCompleted)
             {
-                channel
-            });
+                await SendAsync(Method.Subscribe, new
+                {
+                    channel
+                });
+            }
 
-            _handlers.Add(channel, new IncomingMessageHandler<TData> { Callback = callback });
+            _handlers.TryAdd(channel, new IncomingMessageHandler<TData> { Callback = callback });
         }
 
         private async Task SendAsync(Method method, object @params)
@@ -65,7 +87,7 @@ namespace Centrifuge.Client
                 @params
             };
 
-            await Task.Run(() => _commands.Add(_id, new CommandRecord { IsResponseReceived = false, Id = _id, Method = method, Parameters = @params }));
+            await Task.Run(() => _commands.TryAdd(_id, new CommandRecord { IsResponseReceived = false, Id = _id, Method = method, Parameters = @params }));
 
             await _socket.SendAsync(CommandToBinary(connect), WebSocketMessageType.Text, true, CancellationToken.None);
         }

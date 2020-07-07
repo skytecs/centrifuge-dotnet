@@ -15,12 +15,9 @@ namespace Centrifuge.Client.Demo
         {
             var configuration = new ConfigurationBuilder().AddJsonFile("appsettings.json").AddUserSecrets<Program>().Build();
 
-
             var client = new CentrifugeClient(new Uri(configuration["Url"]), () => GenerateToken(configuration["Secret"]));
 
             var listen = client.Listen();
-
-            await Task.Delay(1000);
 
             await client.Subscribe<string>("test_channel", Console.WriteLine);
 
