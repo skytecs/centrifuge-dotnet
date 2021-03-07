@@ -19,11 +19,15 @@ namespace Centrifuge.Client
         private readonly ClientWebSocket _socket = new ClientWebSocket();
         private readonly ConcurrentDictionary<int, CommandRecord> _commands = new ConcurrentDictionary<int, CommandRecord>();
         private readonly ConcurrentDictionary<string, IIncomingMessageHandler> _handlers = new ConcurrentDictionary<string, IIncomingMessageHandler>();
+        private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+
         private Task _pingTask;
         private Task _connectTask;
         private Task _receiveTask;
         private readonly Uri _url;
         private readonly Func<string> _tokenGenerator;
+
+        public event EventHandler<EventArgs> ConnectionInterrupted;
 
 
         public CentrifugeClient(Uri url, Func<string> tokenGenerator)
@@ -57,9 +61,9 @@ namespace Centrifuge.Client
                 });
             }
 
-            _pingTask = Task.Run(DoPing);
+            _pingTask = Task.Run(() => DoPing(_cancellationTokenSource.Token));
 
-            _receiveTask = Task.Run(DoReceive);
+            _receiveTask = Task.Run(() => DoReceive(_cancellationTokenSource.Token));
 
             await _receiveTask;
 
@@ -94,9 +98,9 @@ namespace Centrifuge.Client
 
         private ArraySegment<byte> CommandToBinary(object command) => new ArraySegment<byte>(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(command)));
 
-        private async Task DoReceive()
+        private async Task DoReceive(CancellationToken cancellationToken)
         {
-            while (_socket.State == WebSocketState.Open)
+            while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
             {
                 using (var buffer = new MemoryStream())
                 {
@@ -106,11 +110,18 @@ namespace Centrifuge.Client
                         var result = await _socket.ReceiveAsync(frame, CancellationToken.None);
 
                         buffer.Write(frame.Array, 0, result.Count);
+
                         if (result.EndOfMessage)
                         {
                             buffer.Position = 0;
 
                             await Process(buffer);
+
+                            if (result.CloseStatus != null)
+                            {
+                                OnConnectionInterrupted();
+                            }
+
                             break;
                         }
                     }
@@ -194,9 +205,9 @@ namespace Centrifuge.Client
         }
 
 
-        private async Task DoPing()
+        private async Task DoPing(CancellationToken cancellationToken)
         {
-            while (_socket.State == WebSocketState.Open)
+            while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
             {
                 await Task.Delay(15000);
 
@@ -211,6 +222,8 @@ namespace Centrifuge.Client
                 if (disposing)
                 {
                     // TODO: dispose managed state (managed objects)
+                    _cancellationTokenSource.Cancel();
+                    _socket.Dispose();
                 }
 
                 // TODO: free unmanaged resources (unmanaged objects) and override finalizer
@@ -231,6 +244,11 @@ namespace Centrifuge.Client
             // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
             Dispose(disposing: true);
             GC.SuppressFinalize(this);
+        }
+
+        protected virtual void OnConnectionInterrupted()
+        {
+            ConnectionInterrupted?.Invoke(this, EventArgs.Empty);
         }
     }
 
