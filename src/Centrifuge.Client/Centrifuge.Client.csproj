@@ -8,7 +8,7 @@
     <Authors>Dmitry Nadolin</Authors>
     <Company />
     <Product>Centrifuge Client</Product>
-    <Version>1.0.1</Version>
+    <Version>1.0.3</Version>
   </PropertyGroup>
 
   <ItemGroup>

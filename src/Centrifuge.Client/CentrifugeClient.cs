@@ -16,7 +16,7 @@ namespace Centrifuge.Client
         private int _id = 0;
         private bool disposedValue;
 
-        private readonly ClientWebSocket _socket = new ClientWebSocket();
+        private ClientWebSocket _socket = new ClientWebSocket();
         private readonly ConcurrentDictionary<int, CommandRecord> _commands = new ConcurrentDictionary<int, CommandRecord>();
         private readonly ConcurrentDictionary<string, IIncomingMessageHandler> _handlers = new ConcurrentDictionary<string, IIncomingMessageHandler>();
         private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
@@ -42,6 +42,12 @@ namespace Centrifuge.Client
 
         public async Task Listen()
         {
+            if (_socket.State != WebSocketState.None)
+            {
+                _socket.Dispose();
+                _socket = new ClientWebSocket();
+            }
+
             await _socket.ConnectAsync(_url, CancellationToken.None);
 
             _connectTask = SendAsync(Method.Connect, new
@@ -91,9 +97,18 @@ namespace Centrifuge.Client
                 @params
             };
 
-            await Task.Run(() => _commands.TryAdd(_id, new CommandRecord { IsResponseReceived = false, Id = _id, Method = method, Parameters = @params }));
+            await Task.Run(() => _commands.TryAdd(_id,
+                new CommandRecord {IsResponseReceived = false, Id = _id, Method = method, Parameters = @params}));
 
-            await _socket.SendAsync(CommandToBinary(connect), WebSocketMessageType.Text, true, CancellationToken.None);
+            if (_socket.State == WebSocketState.Open)
+            {
+                await _socket.SendAsync(CommandToBinary(connect), WebSocketMessageType.Text, true,
+                    CancellationToken.None);
+            }
+            else
+            {
+                OnConnectionInterrupted();
+            }
         }
 
         private ArraySegment<byte> CommandToBinary(object command) => new ArraySegment<byte>(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(command)));
