@@ -27,7 +27,7 @@ namespace Centrifuge.Client
         private readonly Uri _url;
         private readonly Func<string> _tokenGenerator;
 
-        public event EventHandler<EventArgs> ConnectionInterrupted;
+        public event EventHandler<ExceptionEventArgs> ConnectionInterrupted;
 
 
         public CentrifugeClient(Uri url, Func<string> tokenGenerator)
@@ -48,7 +48,15 @@ namespace Centrifuge.Client
                 _socket = new ClientWebSocket();
             }
 
-            await _socket.ConnectAsync(_url, CancellationToken.None);
+            try
+            {
+                await _socket.ConnectAsync(_url, CancellationToken.None);
+            }
+            catch (Exception e)
+            {
+                OnConnectionInterrupted(e);
+                return;
+            }
 
             _connectTask = SendAsync(Method.Connect, new
             {
@@ -71,8 +79,8 @@ namespace Centrifuge.Client
 
             _receiveTask = Task.Run(() => DoReceive(_cancellationTokenSource.Token));
 
-            await _receiveTask;
 
+            await _receiveTask;
         }
 
         public async Task Subscribe<TData>(string channel, Action<TData> callback)
@@ -107,7 +115,7 @@ namespace Centrifuge.Client
             }
             else
             {
-                OnConnectionInterrupted();
+                OnConnectionInterrupted(null);
             }
         }
 
@@ -130,11 +138,20 @@ namespace Centrifuge.Client
                         {
                             buffer.Position = 0;
 
-                            await Process(buffer);
+                            try
+                            {
+                                await Process(buffer);
+                            }
+                            catch (Exception e)
+                            {
+                                OnConnectionInterrupted(e);
+                                return;
+                            }
 
                             if (result.CloseStatus != null)
                             {
-                                OnConnectionInterrupted();
+                                OnConnectionInterrupted(null);
+                                return;
                             }
 
                             break;
@@ -261,10 +278,18 @@ namespace Centrifuge.Client
             GC.SuppressFinalize(this);
         }
 
-        protected virtual void OnConnectionInterrupted()
+        protected virtual void OnConnectionInterrupted(Exception e)
         {
-            ConnectionInterrupted?.Invoke(this, EventArgs.Empty);
+            ConnectionInterrupted?.Invoke(this, new ExceptionEventArgs(e));
         }
     }
 
+    public class ExceptionEventArgs
+    {
+        public ExceptionEventArgs(Exception e)
+        {
+            Exception = e;
+        }
+        public Exception Exception { get; }
+    }
 }
