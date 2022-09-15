@@ -14,21 +14,21 @@ namespace Centrifuge.Client
     public class CentrifugeClient : IDisposable
     {
         private int _id = 0;
-        private bool disposedValue;
+        private bool _disposedValue;
 
         private ClientWebSocket _socket = new ClientWebSocket();
         private readonly ConcurrentDictionary<int, CommandRecord> _commands = new ConcurrentDictionary<int, CommandRecord>();
         private readonly ConcurrentDictionary<string, IIncomingMessageHandler> _handlers = new ConcurrentDictionary<string, IIncomingMessageHandler>();
-        private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+        private readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
 
-        private Task _pingTask;
         private Task _connectTask;
         private Task _receiveTask;
         private readonly Uri _url;
         private readonly Func<string> _tokenGenerator;
 
         public event EventHandler<ExceptionEventArgs> ConnectionInterrupted;
-
+        public event EventHandler<EventArgs> ConnectionEstablished;
+        public event EventHandler<ExceptionEventArgs> FormatError;
 
         public CentrifugeClient(Uri url, Func<string> tokenGenerator)
         {
@@ -75,9 +75,11 @@ namespace Centrifuge.Client
                 });
             }
 
-            _pingTask = Task.Run(() => DoPing(_cancellationTokenSource.Token));
+            var _ = Task.Run(() => DoPing(_cancellationTokenSource.Token));
 
-            _receiveTask = Task.Run(() => DoReceive(_cancellationTokenSource.Token));
+            _receiveTask = DoReceive(_cancellationTokenSource.Token);
+
+            OnConnectionEstablished();
 
 
             await _receiveTask;
@@ -108,6 +110,7 @@ namespace Centrifuge.Client
             await Task.Run(() => _commands.TryAdd(_id,
                 new CommandRecord {IsResponseReceived = false, Id = _id, Method = method, Parameters = @params}));
 
+
             if (_socket.State == WebSocketState.Open)
             {
                 await _socket.SendAsync(CommandToBinary(connect), WebSocketMessageType.Text, true,
@@ -115,7 +118,7 @@ namespace Centrifuge.Client
             }
             else
             {
-                OnConnectionInterrupted(null);
+                OnConnectionInterrupted(new ApplicationException($"Socket wasn't open when sending {JsonConvert.SerializeObject(connect)}"));
             }
         }
 
@@ -123,7 +126,7 @@ namespace Centrifuge.Client
 
         private async Task DoReceive(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 using (var buffer = new MemoryStream())
                 {
@@ -132,30 +135,38 @@ namespace Centrifuge.Client
                         var frame = new ArraySegment<byte>(new byte[8192]);
                         var result = await _socket.ReceiveAsync(frame, CancellationToken.None);
 
-                        buffer.Write(frame.Array, 0, result.Count);
+                        await buffer.WriteAsync(frame.Array, 0, result.Count, cancellationToken);
 
-                        if (result.EndOfMessage)
+                        if (!result.EndOfMessage)
                         {
-                            buffer.Position = 0;
-
-                            try
-                            {
-                                await Process(buffer);
-                            }
-                            catch (Exception e)
-                            {
-                                OnConnectionInterrupted(e);
-                                return;
-                            }
-
-                            if (result.CloseStatus != null)
-                            {
-                                OnConnectionInterrupted(null);
-                                return;
-                            }
-
-                            break;
+                            continue;
                         }
+
+                        buffer.Position = 0;
+
+                        try
+                        {
+                            await Process(buffer);
+                        }
+                        catch (Exception e)
+                        {
+                            OnConnectionInterrupted(e);
+                            return;
+                        }
+
+                        if (result.CloseStatus != null)
+                        {
+                            OnConnectionInterrupted(new ApplicationException($"WebSocket had CloseStatus {result.CloseStatus}"));
+                            return;
+                        }
+
+                        if (_socket.State != WebSocketState.Open)
+                        {
+                            OnConnectionInterrupted(new ApplicationException($"WebSocket had State {_socket.State}"));
+                            return;
+                        }
+
+                        break;
                     }
                 }
             }
@@ -166,7 +177,7 @@ namespace Centrifuge.Client
             using (var streamReader = new StreamReader(stream))
             using (var jsonReader = new JsonTextReader(streamReader))
             {
-                var message = JObject.Load(jsonReader);
+                var message = await JObject.LoadAsync(jsonReader);
 
                 Console.WriteLine(message.ToString());
 
@@ -174,7 +185,7 @@ namespace Centrifuge.Client
 
                 if (errorProperty != null && errorProperty.HasValues)
                 {
-                    await Task.Run(async () => await Accept(errorProperty.Value.ToObject<Error>()));
+                    await Task.Run(() => Accept(errorProperty.Value.ToObject<Error>()));
                 }
 
                 var idProperty = message.Property("id");
@@ -190,11 +201,11 @@ namespace Centrifuge.Client
                             case Method.Connect:
                             case Method.Refresh:
 
-                                var result = message.Property("result").Value.ToObject<ConnectResult>();
+                                var result = message.Property("result")?.Value.ToObject<ConnectResult>();
 
                                 _commands[id].IsResponseReceived = true;
 
-                                await Accept(result);
+                                Accept(result);
 
                                 break;
                         }
@@ -202,23 +213,32 @@ namespace Centrifuge.Client
                 }
                 else
                 {
-                    var result = message.Property("result").Value.ToObject<IncomingResult>();
+                    var result = message.GetValue("result")?.ToObject<IncomingResult>();
 
-                    await Accept(result);
+                    if (result != null)
+                    {
+                        Accept(result);
+                    }
+                    else
+                    {
+                        OnFormatError(new ArgumentNullException(nameof(result)));
+                    }
                 }
             }
         }
 
-        private async Task Accept(IncomingResult result)
+        private void Accept(IncomingResult result)
         {
             _handlers[result.Channel].Call(result.Data);
         }
 
-        private async Task Accept(Error error)
+        private void Accept(Error error)
         {
+            OnFormatError(new Exception($"Centrifuge error: {error?.Code}-{error?.Message}"));
+
         }
 
-        private async Task Accept(ConnectResult result)
+        private void Accept(ConnectResult result)
         {
             // We are sending refresh requests 5 seconds before expiration
             var ttl = Math.Max(result.TTL - 5, 5);
@@ -241,7 +261,7 @@ namespace Centrifuge.Client
         {
             while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
             {
-                await Task.Delay(15000);
+                await Task.Delay(15000, cancellationToken);
 
                 await SendAsync(Method.Ping, null);
             }
@@ -249,7 +269,7 @@ namespace Centrifuge.Client
 
         protected virtual void Dispose(bool disposing)
         {
-            if (!disposedValue)
+            if (!_disposedValue)
             {
                 if (disposing)
                 {
@@ -260,7 +280,7 @@ namespace Centrifuge.Client
 
                 // TODO: free unmanaged resources (unmanaged objects) and override finalizer
                 // TODO: set large fields to null
-                disposedValue = true;
+                _disposedValue = true;
             }
         }
 
@@ -281,6 +301,16 @@ namespace Centrifuge.Client
         protected virtual void OnConnectionInterrupted(Exception e)
         {
             ConnectionInterrupted?.Invoke(this, new ExceptionEventArgs(e));
+        }
+
+        protected virtual void OnFormatError(Exception e)
+        {
+            FormatError?.Invoke(this, new ExceptionEventArgs(e));
+        }
+
+        protected virtual void OnConnectionEstablished()
+        {
+            ConnectionEstablished?.Invoke(this, EventArgs.Empty);
         }
     }
 
